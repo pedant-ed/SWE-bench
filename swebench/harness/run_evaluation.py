@@ -5,6 +5,7 @@ import json
 import platform
 import traceback
 import os
+import logging
 
 if platform.system() == "Linux":
     import resource
@@ -151,26 +152,53 @@ def run_instance(
                 )
                 copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
 
+                # Check file structure in container
+                ls_output = container.exec_run(
+                    "ls -R",
+                    workdir=DOCKER_WORKDIR,
+                    user=DOCKER_USER,
+                )
+                logger.info(f"Container file structure:\n{ls_output.output.decode(UTF8)}")
+
+                # Check git status and repository state
+                git_status = container.exec_run(
+                    "git status",
+                    workdir=DOCKER_WORKDIR,
+                    user=DOCKER_USER,
+                )
+                logger.info(f"Git status:\n{git_status.output.decode(UTF8)}")
+
+                # Check if the target file exists
+                file_check = container.exec_run(
+                    f"find . -name ndarithmetic.py",
+                    workdir=DOCKER_WORKDIR,
+                    user=DOCKER_USER,
+                )
+                logger.info(f"Found files:\n{file_check.output.decode(UTF8)}")
+
                 # Attempt to apply patch to container
-                applied_patch = False
-                for git_apply_cmd in GIT_APPLY_CMDS:
-                    val = container.exec_run(
-                        f"{git_apply_cmd} {DOCKER_PATCH}",
+                patch_success = False
+                for cmd in GIT_APPLY_CMDS:
+                    logger.info(f"Attempting to apply patch with command: {cmd}")
+                    patch_output = container.exec_run(
+                        f"{cmd} {DOCKER_PATCH}",
                         workdir=DOCKER_WORKDIR,
                         user=DOCKER_USER,
                     )
-                    if val.exit_code == 0:
-                        logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-                        applied_patch = True
+                    logger.info(f"Patch command output:\n{patch_output.output.decode(UTF8)}")
+                    if patch_output.exit_code == 0:
+                        patch_success = True
+                        logger.info("Patch applied successfully")
                         break
                     else:
-                        logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-                if not applied_patch:
-                    logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
+                        logger.warning(f"Patch command failed with exit code {patch_output.exit_code}")
+
+                if not patch_success:
+                    logger.error("All patch commands failed")
                     raise EvaluationError(
                         instance_id,
-                        f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
-                        logger,
+                        f">>>>> Patch Apply Failed:\n{patch_output.output.decode(UTF8)}",
+                        logger
                     )
 
                 # Get git diff before running eval script
