@@ -9,10 +9,65 @@ from swebench.harness.constants import (
     KEY_PREDICTION,
     RUN_EVALUATION_LOG_DIR,
     LOG_REPORT,
+    LOG_TEST_OUTPUT,
 )
 from swebench.harness.docker_utils import list_images
 from swebench.harness.test_spec.test_spec import make_test_spec
 
+
+def make_run_report(
+    predictions: dict,
+    dataset: list,
+    run_id: str,
+    client: docker.DockerClient,
+) -> dict:
+    """
+    Make a report of the run results.
+    """
+    # 获取所有实例的结果
+    results = {}
+    for instance in dataset:
+        instance_id = instance[KEY_INSTANCE_ID]
+        if instance_id in predictions:
+            # 获取该实例的所有预测结果
+            instance_predictions = predictions[instance_id]
+            results[instance_id] = []
+            
+            for pred in instance_predictions:
+                # 检查预测是否为空
+                if pred.get(KEY_PREDICTION, None) in ["", None]:
+                    results[instance_id].append({
+                        "status": "error",
+                        "error": "Empty prediction"
+                    })
+                    continue
+                    
+                # 获取测试结果
+                test_output_path = (
+                    RUN_EVALUATION_LOG_DIR
+                    / run_id
+                    / pred[KEY_MODEL].replace("/", "__")
+                    / instance_id
+                    / LOG_TEST_OUTPUT
+                )
+                
+                if not test_output_path.exists():
+                    results[instance_id].append({
+                        "status": "error",
+                        "error": "Test output not found"
+                    })
+                    continue
+                    
+                # 获取评估报告
+                report = get_eval_report(
+                    test_spec=make_test_spec(instance),
+                    prediction=pred,
+                    test_log_path=test_output_path,
+                    include_tests_status=True,
+                )
+                results[instance_id].append(report)
+    
+    return results
 
 def make_run_report(
     predictions: dict,
@@ -51,29 +106,44 @@ def make_run_report(
             # skip instances without predictions
             incomplete_ids.add(instance_id)
             continue
-        prediction = predictions[instance_id]
-        if prediction.get(KEY_PREDICTION, None) in ["", None]:
-            empty_patch_ids.add(instance_id)
-            continue
-        report_file = (
-            RUN_EVALUATION_LOG_DIR
-            / run_id
-            / prediction[KEY_MODEL].replace("/", "__")
-            / prediction[KEY_INSTANCE_ID]
-            / LOG_REPORT
-        )
-        if report_file.exists():
-            # If report file exists, then the instance has been run
-            completed_ids.add(instance_id)
-            report = json.loads(report_file.read_text())
-            if report[instance_id]["resolved"]:
-                # Record if the instance was resolved
-                resolved_ids.add(instance_id)
+            
+        # 处理每个实例的多个预测
+        instance_predictions = predictions[instance_id]
+        if not isinstance(instance_predictions, list):
+            instance_predictions = [instance_predictions]
+            
+        has_valid_prediction = False
+        for pred in instance_predictions:
+            if pred.get(KEY_PREDICTION, None) in ["", None]:
+                continue
+                
+            has_valid_prediction = True
+            prediction_id = pred.get("prediction_id", "default")
+            report_file = (
+                RUN_EVALUATION_LOG_DIR
+                / run_id
+                / pred[KEY_MODEL].replace("/", "__")
+                / instance_id
+                / prediction_id
+                / LOG_REPORT
+            )
+            
+            if report_file.exists():
+                # If report file exists, then the instance has been run
+                completed_ids.add(instance_id)
+                report = json.loads(report_file.read_text())
+                if report[instance_id]["resolved"]:
+                    # Record if the instance was resolved
+                    resolved_ids.add(instance_id)
+                else:
+                    unresolved_ids.add(instance_id)
+                break
             else:
-                unresolved_ids.add(instance_id)
-        else:
-            # Otherwise, the instance was not run successfully
-            error_ids.add(instance_id)
+                # Otherwise, the instance was not run successfully
+                error_ids.add(instance_id)
+                
+        if not has_valid_prediction:
+            empty_patch_ids.add(instance_id)
 
     if client:
         # get remaining images and containers
@@ -120,7 +190,7 @@ def make_run_report(
         "error_ids": list(sorted(error_ids)),
         "schema_version": 2,
     }
-    if not client:
+    if client:
         report.update(
             {
                 "unstopped_instances": len(unstopped_containers),
@@ -128,11 +198,17 @@ def make_run_report(
                 "unremoved_images": list(sorted(unremoved_images)),
             }
         )
+    
+    # 使用第一个预测的模型信息来生成报告文件名
+    first_pred = next(iter(predictions.values()))
+    if isinstance(first_pred, list):
+        first_pred = first_pred[0]
     report_file = Path(
-        list(predictions.values())[0][KEY_MODEL].replace("/", "__")
+        first_pred[KEY_MODEL].replace("/", "__")
         + f".{run_id}"
         + ".json"
     )
+    
     with open(report_file, "w") as f:
         print(json.dumps(report, indent=4), file=f)
     print(f"Report written to {report_file}")

@@ -95,10 +95,16 @@ class TestSpec:
 
     @property
     def instance_image_key(self):
-        key = f"sweb.eval.{self.arch}.{self.instance_id.lower()}:{self.instance_image_tag}"
-        if self.is_remote_image:
-            key = f"{self.namespace}/{key}".replace("__", "_1776_")
-        return key
+        """
+        Get the key for the instance image.
+        """
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            if self.namespace:
+                return f"{self.namespace}/sweb.eval.arm64.{self.instance_id}"
+            return f"sweb.eval.arm64.{self.instance_id}"
+        if self.namespace:
+            return f"{self.namespace}/sweb.eval.{self.instance_id}"
+        return f"sweb.eval.{self.instance_id}"
 
     @property
     def is_remote_image(self):
@@ -133,13 +139,13 @@ class TestSpec:
         return get_dockerfile_instance(self.platform, self.language, self.env_image_key)
 
     @property
-    def platform(self):
-        if self.arch == "x86_64":
-            return "linux/x86_64"
-        elif self.arch == "arm64":
-            return "linux/arm64/v8"
-        else:
-            raise ValueError(f"Invalid architecture: {self.arch}")
+    def platform(self) -> str:
+        """
+        Get the platform for the instance.
+        """
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            return "linux/arm64"
+        return "linux/amd64"
 
 
 def get_test_specs_from_dataset(

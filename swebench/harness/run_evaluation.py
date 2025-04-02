@@ -4,12 +4,14 @@ import docker
 import json
 import platform
 import traceback
+import os
 
 if platform.system() == "Linux":
     import resource
 
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 from pathlib import Path, PurePosixPath
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from swebench.harness.constants import (
     APPLY_PATCH_FAIL,
@@ -59,15 +61,15 @@ from swebench.harness.utils import (
 )
 
 GIT_APPLY_CMDS = [
-    "git apply --verbose",
-    "git apply --verbose --reject",
-    "patch --batch --fuzz=5 -p1 -i",
+    "git apply --verbose -p2",
+    "git apply --verbose --reject -p2",
+    "patch --batch --fuzz=5 -p2 -i",
 ]
 
 
 def run_instance(
     test_spec: TestSpec,
-    pred: dict,
+    preds: list,
     rm_image: bool,
     force_rebuild: bool,
     client: docker.DockerClient,
@@ -76,190 +78,210 @@ def run_instance(
     rewrite_reports: bool = False,
 ):
     """
-    Run a single instance with the given prediction.
-
-    Args:
-        test_spec (TestSpec): TestSpec instance
-        pred (dict): Prediction w/ model_name_or_path, model_patch, instance_id
-        rm_image (bool): Whether to remove the image after running
-        force_rebuild (bool): Whether to force rebuild the image
-        client (docker.DockerClient): Docker client
-        run_id (str): Run ID
-        timeout (int): Timeout for running tests
-        rewrite_reports (bool): True if eval run is just to reformat existing report
+    Run a single instance with multiple predictions if available.
     """
-    # Set up logging directory
-    instance_id = test_spec.instance_id
-    model_name_or_path = pred.get(KEY_MODEL, "None").replace("/", "__")
-    log_dir = RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
-
-    # Set up report file
-    report_path = log_dir / LOG_REPORT
-    if rewrite_reports:
-        test_output_path = log_dir / LOG_TEST_OUTPUT
-        if not test_output_path.exists():
-            raise ValueError(f"Test output file {test_output_path} does not exist")
-        report = get_eval_report(
-            test_spec=test_spec,
-            prediction=pred,
-            test_log_path=test_output_path,
-            include_tests_status=True,
-        )
-        # Write report to report.json
-        with open(report_path, "w") as f:
-            f.write(json.dumps(report, indent=4))
-        return instance_id, report
-    if report_path.exists():
-        return instance_id, json.loads(report_path.read_text())
-
-    if not test_spec.is_remote_image:
-        # Link the image build dir in the log dir
-        build_dir = INSTANCE_IMAGE_BUILD_DIR / test_spec.instance_image_key.replace(
-            ":", "__"
-        )
-        image_build_link = log_dir / "image_build_dir"
-        if not image_build_link.exists():
-            try:
-                # link the image build dir in the log dir
-                image_build_link.symlink_to(
-                    build_dir.absolute(), target_is_directory=True
-                )
-            except:
-                # some error, idk why
-                pass
-
-    # Set up logger
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / LOG_INSTANCE
-    logger = setup_logger(instance_id, log_file)
-
-    # Run the instance
+    results = []
     container = None
+    logger = None
+    
     try:
-        # Build + start instance container (instance image should already be built)
-        container = build_container(
-            test_spec, client, run_id, logger, rm_image, force_rebuild
-        )
-        container.start()
-        logger.info(f"Container for {instance_id} started: {container.id}")
+        # Set up logging directory
+        instance_id = test_spec.instance_id
+        model_name_or_path = preds[0].get(KEY_MODEL, "None").replace("/", "__")
+        base_log_dir = RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
+        
+        for pred in preds:
+            try:
+                # 使用prediction_id创建唯一的日志目录
+                prediction_id = pred.get("prediction_id", "default")
+                log_dir = base_log_dir / prediction_id
+                log_dir.mkdir(parents=True, exist_ok=True)
+                log_file = log_dir / LOG_INSTANCE
+                logger = setup_logger(f"{instance_id}_{prediction_id}", log_file)
+                
+                # Set up report file
+                report_path = log_dir / LOG_REPORT
+                if rewrite_reports:
+                    test_output_path = log_dir / LOG_TEST_OUTPUT
+                    if not test_output_path.exists():
+                        raise ValueError(f"Test output file {test_output_path} does not exist")
+                    report = get_eval_report(
+                        test_spec=test_spec,
+                        prediction=pred,
+                        test_log_path=test_output_path,
+                        include_tests_status=True,
+                    )
+                    # Write report to report.json
+                    with open(report_path, "w") as f:
+                        f.write(json.dumps(report, indent=4))
+                    results.append(report)
+                    continue
+                if report_path.exists():
+                    results.append(json.loads(report_path.read_text()))
+                    continue
 
-        # Copy model prediction as patch file to container
-        patch_file = Path(log_dir / "patch.diff")
-        patch_file.write_text(pred[KEY_PREDICTION] or "")
-        logger.info(
-            f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
-        )
-        copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
+                if not test_spec.is_remote_image:
+                    # Link the image build dir in the log dir
+                    build_dir = INSTANCE_IMAGE_BUILD_DIR / test_spec.instance_image_key.replace(
+                        ":", "__"
+                    ) / prediction_id
+                    image_build_link = log_dir / "image_build_dir"
+                    if not image_build_link.exists():
+                        try:
+                            # link the image build dir in the log dir
+                            image_build_link.symlink_to(
+                                build_dir.absolute(), target_is_directory=True
+                            )
+                        except:
+                            # some error, idk why
+                            pass
 
-        # Attempt to apply patch to container (TODO: FIX THIS)
-        applied_patch = False
-        for git_apply_cmd in GIT_APPLY_CMDS:
-            val = container.exec_run(
-                f"{git_apply_cmd} {DOCKER_PATCH}",
-                workdir=DOCKER_WORKDIR,
-                user=DOCKER_USER,
-            )
-            if val.exit_code == 0:
-                logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
-                applied_patch = True
-                break
-            else:
-                logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
-        if not applied_patch:
-            logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
-            raise EvaluationError(
-                instance_id,
-                f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
-                logger,
-            )
+                # Build + start instance container (instance image should already be built)
+                container = build_container(
+                    test_spec, client, run_id, logger, rm_image, force_rebuild, prediction_id
+                )
+                container.start()
+                logger.info(f"Container for {instance_id}_{prediction_id} started: {container.id}")
 
-        # Get git diff before running eval script
-        git_diff_output_before = (
-            container.exec_run(
-                "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
-            )
-            .output.decode(UTF8)
-            .strip()
-        )
-        logger.info(f"Git diff before:\n{git_diff_output_before}")
+                # Copy model prediction as patch file to container
+                patch_file = Path(log_dir / "patch.diff")
+                patch_file.write_text(pred[KEY_PREDICTION] or "")
+                logger.info(
+                    f"Intermediate patch for {instance_id}_{prediction_id} written to {patch_file}, now applying to container..."
+                )
+                copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
 
-        eval_file = Path(log_dir / "eval.sh")
-        eval_file.write_text(test_spec.eval_script)
-        logger.info(
-            f"Eval script for {instance_id} written to {eval_file}; copying to container..."
-        )
-        copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
+                # Attempt to apply patch to container
+                applied_patch = False
+                for git_apply_cmd in GIT_APPLY_CMDS:
+                    val = container.exec_run(
+                        f"{git_apply_cmd} {DOCKER_PATCH}",
+                        workdir=DOCKER_WORKDIR,
+                        user=DOCKER_USER,
+                    )
+                    if val.exit_code == 0:
+                        logger.info(f"{APPLY_PATCH_PASS}:\n{val.output.decode(UTF8)}")
+                        applied_patch = True
+                        break
+                    else:
+                        logger.info(f"Failed to apply patch to container: {git_apply_cmd}")
+                if not applied_patch:
+                    logger.info(f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}")
+                    raise EvaluationError(
+                        instance_id,
+                        f"{APPLY_PATCH_FAIL}:\n{val.output.decode(UTF8)}",
+                        logger,
+                    )
 
-        # Run eval script, write output to logs
-        test_output, timed_out, total_runtime = exec_run_with_timeout(
-            container, "/bin/bash /eval.sh", timeout
-        )
-        test_output_path = log_dir / LOG_TEST_OUTPUT
-        logger.info(f"Test runtime: {total_runtime:_.2f} seconds")
-        with open(test_output_path, "w") as f:
-            f.write(test_output)
-            logger.info(f"Test output for {instance_id} written to {test_output_path}")
-            if timed_out:
-                f.write(f"\n\nTimeout error: {timeout} seconds exceeded.")
-                raise EvaluationError(
-                    instance_id,
-                    f"Test timed out after {timeout} seconds.",
-                    logger,
+                # Get git diff before running eval script
+                git_diff_output_before = (
+                    container.exec_run(
+                        "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
+                    )
+                    .output.decode(UTF8)
+                    .strip()
+                )
+                logger.info(f"Git diff before:\n{git_diff_output_before}")
+
+                eval_file = Path(log_dir / "eval.sh")
+                eval_file.write_text(test_spec.eval_script)
+                logger.info(
+                    f"Eval script for {instance_id}_{prediction_id} written to {eval_file}; copying to container..."
+                )
+                copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
+
+                # Run eval script, write output to logs
+                test_output, timed_out, total_runtime = exec_run_with_timeout(
+                    container, "/bin/bash /eval.sh", timeout
+                )
+                test_output_path = log_dir / LOG_TEST_OUTPUT
+                logger.info(f"Test runtime: {total_runtime:_.2f} seconds")
+                with open(test_output_path, "w") as f:
+                    f.write(test_output)
+                    logger.info(f"Test output for {instance_id}_{prediction_id} written to {test_output_path}")
+                    if timed_out:
+                        f.write(f"\n\nTimeout error: {timeout} seconds exceeded.")
+                        raise EvaluationError(
+                            instance_id,
+                            f"Test timed out after {timeout} seconds.",
+                            logger,
+                        )
+
+                # Get git diff after running eval script (ignore permission changes)
+                git_diff_output_after = (
+                    container.exec_run(
+                        "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
+                    )
+                    .output.decode(UTF8)
+                    .strip()
                 )
 
-        # Get git diff after running eval script (ignore permission changes)
-        git_diff_output_after = (
-            container.exec_run(
-                "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
-            )
-            .output.decode(UTF8)
-            .strip()
-        )
+                # Check if git diff changed after running eval script
+                logger.info(f"Git diff after:\n{git_diff_output_after}")
+                if git_diff_output_after != git_diff_output_before:
+                    logger.info("Git diff changed after running eval script")
 
-        # Check if git diff changed after running eval script
-        logger.info(f"Git diff after:\n{git_diff_output_after}")
-        if git_diff_output_after != git_diff_output_before:
-            logger.info("Git diff changed after running eval script")
+                # Get report from test output
+                logger.info(f"Grading answer for {instance_id}_{prediction_id}...")
+                report = get_eval_report(
+                    test_spec=test_spec,
+                    prediction=pred,
+                    test_log_path=test_output_path,
+                    include_tests_status=True,
+                )
+                logger.info(
+                    f"report: {report}\n"
+                    f"Result for {instance_id}_{prediction_id}: resolved: {report[instance_id]['resolved']}"
+                )
 
-        # Get report from test output
-        logger.info(f"Grading answer for {instance_id}...")
-        report = get_eval_report(
-            test_spec=test_spec,
-            prediction=pred,
-            test_log_path=test_output_path,
-            include_tests_status=True,
-        )
-        logger.info(
-            f"report: {report}\n"
-            f"Result for {instance_id}: resolved: {report[instance_id]['resolved']}"
-        )
-
-        # Write report to report.json
-        with open(report_path, "w") as f:
-            f.write(json.dumps(report, indent=4))
-        return instance_id, report
-    except EvaluationError as e:
-        error_msg = traceback.format_exc()
-        logger.info(error_msg)
-        print(e)
-    except BuildImageError as e:
-        error_msg = traceback.format_exc()
-        logger.info(error_msg)
-        print(e)
+                # Write report to report.json
+                with open(report_path, "w") as f:
+                    f.write(json.dumps(report, indent=4))
+                results.append(report)
+                
+            except Exception as e:
+                error_msg = traceback.format_exc()
+                if logger:
+                    logger.error(error_msg)
+                print(e)
+                results.append({
+                    "instance_id": test_spec.instance_id,
+                    "prediction_id": pred.get("prediction_id", "default"),
+                    "model_patch": pred[KEY_PREDICTION],
+                    "status": "error",
+                    "error": str(e)
+                })
+            finally:
+                # Remove instance container + image, close logger
+                if container:
+                    cleanup_container(client, container, logger)
+                    if rm_image:
+                        remove_image(client, test_spec.instance_image_key, logger)
+                if logger:
+                    close_logger(logger)
+                container = None
+                
     except Exception as e:
-        error_msg = (
-            f"Error in evaluating model for {instance_id}: {e}\n"
-            f"{traceback.format_exc()}\n"
-            f"Check ({logger.log_file}) for more information."
-        )
-        logger.error(error_msg)
+        error_msg = traceback.format_exc()
+        if logger:
+            logger.error(error_msg)
+        print(e)
+        results.append({
+            "instance_id": test_spec.instance_id,
+            "prediction_id": preds[0].get("prediction_id", "default") if preds else "default",
+            "model_patch": preds[0][KEY_PREDICTION] if preds else "",
+            "status": "error",
+            "error": str(e)
+        })
     finally:
-        # Remove instance container + image, close logger
-        cleanup_container(client, container, logger)
-        if rm_image:
-            remove_image(client, test_spec.instance_image_key, logger)
-        close_logger(logger)
-    return
+        if container:
+            cleanup_container(client, container, logger)
+            if rm_image:
+                remove_image(client, test_spec.instance_image_key, logger)
+        if logger:
+            close_logger(logger)
+            
+    return results
 
 
 def run_instances(
@@ -276,17 +298,7 @@ def run_instances(
     rewrite_reports: bool = False,
 ):
     """
-    Run all instances for the given predictions in parallel.
-
-    Args:
-        predictions (dict): Predictions dict generated by the model
-        instances (list): List of instances
-        cache_level (str): Cache level
-        clean (bool): Clean images above cache level
-        force_rebuild (bool): Force rebuild images
-        max_workers (int): Maximum number of workers
-        run_id (str): Run ID
-        timeout (int): Timeout for running tests
+    Run instances in parallel with multiple predictions per instance.
     """
     client = docker.from_env()
     test_specs = list(
@@ -314,28 +326,47 @@ def run_instances(
     # run instances in parallel
     payloads = []
     for test_spec in test_specs:
-        payloads.append(
-            (
-                test_spec,
-                predictions[test_spec.instance_id],
-                should_remove(
-                    test_spec.instance_image_key,
-                    cache_level,
-                    clean,
-                    existing_images,
-                ),
-                force_rebuild,
-                client,
-                run_id,
-                timeout,
-                rewrite_reports,
+        instance_predictions = predictions.get(test_spec.instance_id, [])
+        if instance_predictions:
+            payloads.append(
+                (
+                    test_spec,
+                    instance_predictions,
+                    should_remove(
+                        test_spec.instance_image_key,
+                        cache_level,
+                        clean,
+                        existing_images,
+                    ),
+                    force_rebuild,
+                    client,
+                    run_id,
+                    timeout,
+                    rewrite_reports,
+                )
             )
-        )
 
     # run instances in parallel
     print(f"Running {len(instances)} instances...")
-    run_threadpool(run_instance, payloads, max_workers)
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(run_instance, *payload) for payload in payloads]
+        for future in as_completed(futures):
+            try:
+                instance_results = future.result()
+                if instance_results and isinstance(instance_results, list):
+                    # 确保结果列表不为空且包含有效的instance_id
+                    for result in instance_results:
+                        if isinstance(result, dict) and "instance_id" in result:
+                            instance_id = result["instance_id"]
+                            if instance_id not in results:
+                                results[instance_id] = []
+                            results[instance_id].append(result)
+            except Exception as e:
+                print(f"Error in thread: {str(e)}")
+                print(f"Traceback: {traceback.format_exc()}")
     print("All instances run.")
+    return results
 
 
 def get_dataset_from_preds(
@@ -344,98 +375,73 @@ def get_dataset_from_preds(
     instance_ids: list,
     predictions: dict,
     run_id: str,
-    rewrite_reports: bool,
-    exclude_completed: bool = True,
-):
+    rewrite_reports: bool = False,
+) -> list:
     """
-    Return only instances that have predictions and are in the dataset.
-    If instance_ids is provided, only return instances with those IDs.
-    If exclude_completed is True, only return instances that have not been run yet.
+    Get dataset from predictions, handling multiple predictions per instance.
     """
-    # load dataset
+    # 获取所有实例ID
+    all_instance_ids = list(predictions.keys())
+    
+    # 如果指定了instance_ids，只保留这些实例
+    if instance_ids:
+        all_instance_ids = [x for x in all_instance_ids if x in instance_ids]
+    
+    # 获取数据集
     dataset = load_swebench_dataset(dataset_name, split)
-    dataset_ids = {i[KEY_INSTANCE_ID] for i in dataset}
-
-    if instance_ids:
-        # check that all instance IDs have predictions
-        missing_preds = set(instance_ids) - set(predictions.keys())
-        if missing_preds:
-            print(
-                f"Warning: Missing predictions for {len(missing_preds)} instance IDs."
-            )
-
-    # check that all prediction IDs are in the dataset
-    prediction_ids = set(predictions.keys())
-    if prediction_ids - dataset_ids:
-        raise ValueError(
-            (
-                "Some prediction IDs not found in dataset!"
-                f"\nMissing IDs:\n{' '.join(prediction_ids - dataset_ids)}"
-            )
-        )
-    if instance_ids:
-        dataset = [i for i in dataset if i[KEY_INSTANCE_ID] in instance_ids]
-
-    if rewrite_reports:
-        # we only return instances that have existing test outputs
-        test_output_ids = set()
-        for instance in dataset:
-            if instance[KEY_INSTANCE_ID] not in predictions:
-                continue
-            prediction = predictions[instance[KEY_INSTANCE_ID]]
-            test_output_file = (
-                RUN_EVALUATION_LOG_DIR
-                / run_id
-                / prediction["model_name_or_path"].replace("/", "__")
-                / prediction[KEY_INSTANCE_ID]
-                / "test_output.txt"
-            )
-            if test_output_file.exists():
-                test_output_ids.add(instance[KEY_INSTANCE_ID])
-        dataset = [
-            i
-            for i in dataset
-            if i[KEY_INSTANCE_ID] in prediction_ids
-            and i[KEY_INSTANCE_ID] in test_output_ids
-        ]
-        return dataset
-
-    # check which instance IDs have already been run
-    completed_ids = set()
+    
+    # 过滤数据集
+    filtered_dataset = []
     for instance in dataset:
-        if instance[KEY_INSTANCE_ID] not in prediction_ids:
-            # skip instances without predictions
-            continue
-        prediction = predictions[instance[KEY_INSTANCE_ID]]
-        report_file = (
-            RUN_EVALUATION_LOG_DIR
-            / run_id
-            / prediction[KEY_MODEL].replace("/", "__")
-            / prediction[KEY_INSTANCE_ID]
-            / LOG_REPORT
-        )
-        if report_file.exists():
-            completed_ids.add(instance[KEY_INSTANCE_ID])
+        instance_id = instance[KEY_INSTANCE_ID]
+        if instance_id in predictions:
+            # 使用第一个预测的模型信息
+            first_pred = predictions[instance_id][0]
+            instance[KEY_MODEL] = first_pred[KEY_MODEL]
+            filtered_dataset.append(instance)
+    
+    return filtered_dataset
 
-    if completed_ids and exclude_completed:
-        # filter dataset to only instances that have not been run
-        print(f"{len(completed_ids)} instances already run, skipping...")
-        dataset = [i for i in dataset if i[KEY_INSTANCE_ID] not in completed_ids]
 
-    empty_patch_ids = {
-        k
-        for k, v in predictions.items()
-        if v[KEY_PREDICTION] == "" or v[KEY_PREDICTION] is None
-    }
-
-    # filter dataset to only instances with predictions
-    dataset = [
-        i
-        for i in dataset
-        if i[KEY_INSTANCE_ID] in prediction_ids
-        and i[KEY_INSTANCE_ID] not in empty_patch_ids
-    ]
-    return dataset
+def get_predictions_from_file(predictions_path: str, dataset_name: str, split: str) -> dict:
+    """
+    Get predictions from a file.
+    Returns a dictionary with instance_id as key and list of predictions as value.
+    """
+    predictions = {}
+    
+    if os.path.isfile(predictions_path):
+        with open(predictions_path, "r") as f:
+            if predictions_path.endswith(".jsonl"):
+                # 处理 jsonl 格式
+                for line in f:
+                    pred = json.loads(line)
+                    instance_id = pred["instance_id"]
+                    if instance_id not in predictions:
+                        predictions[instance_id] = []
+                    predictions[instance_id].append(pred)
+            else:
+                # 处理 json 格式
+                predictions = json.load(f)
+    else:
+        # 处理目录
+        for file in os.listdir(predictions_path):
+            if file.endswith(".jsonl"):
+                file_path = os.path.join(predictions_path, file)
+                with open(file_path, "r") as f:
+                    for line in f:
+                        pred = json.loads(line)
+                        instance_id = pred["instance_id"]
+                        if instance_id not in predictions:
+                            predictions[instance_id] = []
+                        predictions[instance_id].append(pred)
+            elif file.endswith(".json"):
+                file_path = os.path.join(predictions_path, file)
+                with open(file_path, "r") as f:
+                    file_predictions = json.load(f)
+                    predictions.update(file_predictions)
+    
+    return predictions
 
 
 def main(
@@ -480,7 +486,6 @@ def main(
 
     # load predictions as map of instance_id to prediction
     predictions = get_predictions_from_file(predictions_path, dataset_name, split)
-    predictions = {pred[KEY_INSTANCE_ID]: pred for pred in predictions}
 
     # get dataset from predictions
     dataset = get_dataset_from_preds(
